@@ -59,7 +59,6 @@ bakdav --help
 - `curl`
 - `openssl`
 - `tar`
-- `xmllint`
 
 设置定时任务时还需要：
 

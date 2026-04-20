@@ -173,6 +173,14 @@ webdav_request_body() {
         "$url"
 }
 
+extract_webdav_hrefs() {
+    local response_file="$1"
+
+    tr '\n' ' ' <"$response_file" \
+        | sed 's|>[[:space:]]*<|>\n<|g' \
+        | sed -n 's|.*<[^>]*href[^>]*>\([^<]*\)</[^>]*href>.*|\1|p'
+}
+
 list_backup_entries() {
     local source_name="$1"
 
@@ -288,8 +296,7 @@ list_remote_backup_names() {
 
     webdav_request_body PROPFIND "$(join_webdav_url "$WEBDAV_REMOTE_DIR")" --header "Depth: 1" >"$response_file"
 
-    xmllint --format "$response_file" 2>/dev/null \
-        | sed -n 's|.*<[^>]*href>\(.*\)</[^>]*href>.*|\1|p' \
+    extract_webdav_hrefs "$response_file" \
         | while IFS= read -r href; do
             local decoded_href
             local file_name
@@ -695,7 +702,6 @@ run_backup() {
     require_command tar
     require_command curl
     require_command openssl
-    require_command xmllint
 
     load_credentials
     if [ "$WEBDAV_REMOTE_DIR_CONFIGURED" -eq 0 ]; then
