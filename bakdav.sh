@@ -12,6 +12,8 @@ COMMAND_NAME="bakdav"
 COMMAND_LINK="$BIN_DIR/$COMMAND_NAME"
 CRON_MARKER="# bakdav-managed-job"
 DAYS_TO_KEEP=7
+REMOTE_BACKUPS_TO_KEEP=30
+BACKUP_STATE_PREFIX=".bakdav-state"
 
 WEBDAV_URL=""
 WEBDAV_REMOTE_DIR=""
@@ -155,6 +157,194 @@ webdav_request_status() {
         --request "$method" \
         "$@" \
         "$url" || true
+}
+
+webdav_request_body() {
+    local method="$1"
+    local url="$2"
+    shift 2
+
+    curl \
+        --silent \
+        --show-error \
+        --user "$WEBDAV_USER:$WEBDAV_PASS" \
+        --request "$method" \
+        "$@" \
+        "$url"
+}
+
+list_backup_entries() {
+    local source_name="$1"
+
+    if find -s "$source_name" -print >/dev/null 2>&1; then
+        find -s "$source_name" \( -type d -o -type f -o -type l \) -print0
+    else
+        find "$source_name" \( -type d -o -type f -o -type l \) -print0 | LC_ALL=C sort -z
+    fi
+}
+
+get_backup_state_name() {
+    local source_name="$1"
+    printf "%s_%s.sha256" "$BACKUP_STATE_PREFIX" "$source_name"
+}
+
+calculate_backup_digest() {
+    local backup_dir="$1"
+    local source_name
+    local parent_dir
+    local digest_input
+
+    source_name="$(basename "$backup_dir")"
+    parent_dir="$(dirname "$backup_dir")"
+    digest_input="$(mktemp "$BACKUP_TMP_DIR/digest_input.XXXXXX")"
+
+    (
+        cd "$parent_dir"
+        while IFS= read -r -d '' entry; do
+            if [ -d "$entry" ]; then
+                printf "dir\t%s\n" "$entry"
+            elif [ -L "$entry" ]; then
+                printf "lnk\t%s\t%s\n" "$entry" "$(readlink "$entry")"
+            elif [ -f "$entry" ]; then
+                printf "file\t%s\t%s\n" \
+                    "$entry" \
+                    "$(openssl dgst -sha256 "$entry" | awk '{print $NF}')"
+            fi
+        done < <(list_backup_entries "$source_name")
+    ) >"$digest_input"
+
+    openssl dgst -sha256 "$digest_input" | awk '{print $NF}'
+    rm -f "$digest_input"
+}
+
+fetch_remote_file() {
+    local remote_path="$1"
+    local output_file="$2"
+    local status
+
+    status="$(
+        curl \
+            --silent \
+            --show-error \
+            --output "$output_file" \
+            --write-out "%{http_code}" \
+            --user "$WEBDAV_USER:$WEBDAV_PASS" \
+            "$(join_webdav_url "$remote_path")" || true
+    )"
+
+    case "$status" in
+        2??|3??)
+            return 0
+            ;;
+        404)
+            rm -f "$output_file"
+            return 1
+            ;;
+        *)
+            rm -f "$output_file"
+            echo "读取 WebDAV 文件失败: $remote_path"
+            echo "HTTP 状态码: ${status:-unknown}"
+            exit 1
+            ;;
+    esac
+}
+
+read_remote_backup_digest() {
+    local source_name="$1"
+    local state_name
+    local state_file
+
+    state_name="$(get_backup_state_name "$source_name")"
+    state_file="$(mktemp "$BACKUP_TMP_DIR/remote_state.XXXXXX")"
+
+    if ! fetch_remote_file "$state_name" "$state_file"; then
+        rm -f "$state_file"
+        return 1
+    fi
+
+    awk 'NF { print $1; exit }' "$state_file"
+    rm -f "$state_file"
+}
+
+write_remote_backup_digest() {
+    local source_name="$1"
+    local digest="$2"
+    local state_name
+    local state_file
+
+    state_name="$(get_backup_state_name "$source_name")"
+    state_file="$(mktemp "$BACKUP_TMP_DIR/remote_state.XXXXXX")"
+    printf "%s\n" "$digest" >"$state_file"
+
+    upload_to_webdav_as "$state_file" "$state_name"
+    rm -f "$state_file"
+}
+
+list_remote_backup_names() {
+    local source_name="$1"
+    local response_file
+
+    response_file="$(mktemp "$BACKUP_TMP_DIR/webdav_list.XXXXXX")"
+
+    webdav_request_body PROPFIND "$(join_webdav_url "$WEBDAV_REMOTE_DIR")" --header "Depth: 1" >"$response_file"
+
+    xmllint --format "$response_file" 2>/dev/null \
+        | sed -n 's|.*<[^>]*href>\(.*\)</[^>]*href>.*|\1|p' \
+        | while IFS= read -r href; do
+            local decoded_href
+            local file_name
+
+            decoded_href="$(printf "%b" "${href//%/\\x}")"
+            decoded_href="${decoded_href%/}"
+            file_name="${decoded_href##*/}"
+
+            case "$file_name" in
+                backup_"$source_name"_*.tar.gz)
+                    printf "%s\n" "$file_name"
+                    ;;
+            esac
+        done | LC_ALL=C sort -r
+
+    rm -f "$response_file"
+}
+
+delete_remote_file() {
+    local remote_path="$1"
+    local status
+
+    status="$(webdav_request_status DELETE "$(join_webdav_url "$remote_path")")"
+
+    case "$status" in
+        2??|3??|404)
+            return 0
+            ;;
+        *)
+            echo "删除远端旧备份失败: $remote_path"
+            echo "HTTP 状态码: ${status:-unknown}"
+            exit 1
+            ;;
+    esac
+}
+
+cleanup_remote_backups() {
+    local source_name="$1"
+    local backup_names
+    local backup_count=0
+
+    backup_names="$(list_remote_backup_names "$source_name")"
+    [ -z "$backup_names" ] && return 0
+
+    while IFS= read -r backup_name; do
+        [ -z "$backup_name" ] && continue
+        backup_count=$((backup_count + 1))
+
+        if [ "$backup_count" -le "$REMOTE_BACKUPS_TO_KEEP" ]; then
+            continue
+        fi
+
+        delete_remote_file "$backup_name"
+        echo "已删除远端旧备份: $backup_name"
+    done <<<"$backup_names"
 }
 
 save_credentials() {
@@ -483,14 +673,21 @@ cleanup_old_backups() {
 upload_to_webdav() {
     local backup_file="$1"
     local remote_name
-    local upload_url
 
     remote_name="$(basename "$backup_file")"
+    upload_to_webdav_as "$backup_file" "$remote_name"
+}
+
+upload_to_webdav_as() {
+    local local_file="$1"
+    local remote_name="$2"
+    local upload_url
+
     upload_url="$(join_webdav_url "$WEBDAV_REMOTE_DIR")/$remote_name"
 
     curl --fail --silent --show-error \
         --user "$WEBDAV_USER:$WEBDAV_PASS" \
-        -T "$backup_file" \
+        -T "$local_file" \
         "$upload_url"
 }
 
@@ -498,6 +695,7 @@ run_backup() {
     require_command tar
     require_command curl
     require_command openssl
+    require_command xmllint
 
     load_credentials
     if [ "$WEBDAV_REMOTE_DIR_CONFIGURED" -eq 0 ]; then
@@ -517,16 +715,28 @@ run_backup() {
     local timestamp
     local source_name
     local backup_file
+    local local_digest
+    local remote_digest
 
     timestamp="$(date +"%Y-%m-%d_%H-%M-%S")"
     source_name="$(basename "$BACKUP_DIR")"
     backup_file="$BACKUP_TMP_DIR/backup_${source_name}_${timestamp}.tar.gz"
+    local_digest="$(calculate_backup_digest "$BACKUP_DIR")"
+    remote_digest="$(read_remote_backup_digest "$source_name" || true)"
+
+    if [ -n "$remote_digest" ] && [ "$local_digest" = "$remote_digest" ]; then
+        echo "备份源未变化，跳过本次备份。"
+        cleanup_old_backups
+        return 0
+    fi
 
     echo "开始创建备份: $BACKUP_DIR"
     tar -czf "$backup_file" -C "$(dirname "$BACKUP_DIR")" "$source_name"
 
     echo "上传到 WebDAV: $(join_webdav_url "$WEBDAV_REMOTE_DIR")"
     upload_to_webdav "$backup_file"
+    write_remote_backup_digest "$source_name" "$local_digest"
+    cleanup_remote_backups "$source_name"
 
     echo "备份完成: $backup_file"
     cleanup_old_backups
@@ -554,6 +764,7 @@ BakDav 使用说明
      ${CRED_FILE}
   5. 备份目录配置保存在:
      ${JOB_FILE}
+  6. 远端默认保留最近 ${REMOTE_BACKUPS_TO_KEEP} 份备份；源目录无变化时会跳过新备份
 EOF
 }
 
